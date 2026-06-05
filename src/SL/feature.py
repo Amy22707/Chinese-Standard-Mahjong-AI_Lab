@@ -256,7 +256,7 @@ class FeatureAgent(MahjongGBAgent):
     Hu
     Play XX
     Chi XX
-    Peng9
+    Peng
     Gang
     (An)Gang XX
     BuGang XX

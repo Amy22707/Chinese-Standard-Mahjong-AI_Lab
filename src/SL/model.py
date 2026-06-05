@@ -24,9 +24,8 @@ class CNNModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight)
 
     def forward(self, input_dict):
-        self.train(mode = input_dict.get("is_training", False))
-        obs = input_dict["obs"]["observation"].float()
+        obs = input_dict["observation"].float()
         action_logits = self._tower(obs)
-        action_mask = input_dict["obs"]["action_mask"].float()
+        action_mask = input_dict["action_mask"].float()
         inf_mask = torch.clamp(torch.log(action_mask), -1e38, 1e38)
         return action_logits + inf_mask
