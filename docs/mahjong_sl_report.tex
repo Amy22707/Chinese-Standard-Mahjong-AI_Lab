@@ -1,0 +1,599 @@
+% ============================================================
+%  基于监督学习的国标麻将AI优化：特征工程、网络结构与推理后处理
+%  ICML 2026 template (single submission, Chinese)
+%  编译方式：xelatex -> bibtex -> xelatex -> xelatex
+%  或：xelatex mahjong_sl_report.tex (两次以生成目录/交叉引用)
+% ============================================================
+
+\documentclass{article}
+
+% ---------- ICML-style packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{xeCJK}             % XeLaTeX 中文支持（比 CJKutf8 更稳定）
+\setCJKmainfont{SimSun}        % 宋体；可换 FandolSong / NotoSerifCJKsc
+\setCJKsansfont{SimHei}
+\setCJKmonofont{FangSong}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{multicol}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,fit,backgrounds}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+% ---------- Page layout (ICML-like, A4) ----------
+\geometry{
+  a4paper,
+  top=2.4cm, bottom=2.4cm,
+  left=1.8cm, right=1.8cm
+}
+\setlength{\columnsep}{0.75cm}
+
+% ---------- Handy macros ----------
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\calL}{\mathcal{L}}
+\newcommand{\calB}{\mathcal{B}}
+\newcommand{\RR}{\mathbb{R}}
+
+% ============================================================
+\title{%
+  \textbf{基于监督学习的国标麻将AI优化}\\
+  \large 特征工程、网络结构与推理后处理
+}
+
+\author{%
+  匿名作者 \\
+  北京大学 \\
+  \texttt{Botzone 平台}
+}
+\date{2026 年 6 月}
+
+% ============================================================
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% -------- Abstract --------
+\begin{abstract}
+国标麻将（Chinese Standard Mahjong，CSM）是一个具有高度不确定性、部分可观测性和
+多智能体竞争特性的复杂棋牌游戏。本文系统总结了在 Botzone 平台上构建和优化 CSM
+监督学习（Supervised Learning，SL）Bot 的完整过程。
+我们从仅 $6$ 通道的基础特征出发，逐步扩展至 $66$ 通道的丰富特征表示，
+引入基于残差网络（ResNet）的分头（multi-head）神经网络，
+并设计了结合危险度估计、向听数感知和特殊牌型检测的推理后处理框架。
+同时，我们探索了赢家数据过滤、番数加权采样等训练技巧，
+并在华为 Ascend NPU 上完成实际训练，解决了若干平台特有的数值稳定性问题。
+实验观察表明，特征扩展与规则后处理对 Bot 行为影响显著，
+并发现多个有趣现象——碰/杠行为消失、点炮率过高、胡牌番数偏低——
+本文分析了其根因并给出系统性解法。
+\end{abstract}
+
+\vspace{-4pt}
+\begin{multicols}{2}
+
+% ============================================================
+\section{引言}
+\label{sec:intro}
+% ============================================================
+
+国标麻将是中国最流行的棋牌游戏之一，规则复杂性远超日本麻将：
+共 81 种番型、144 张牌、4 名玩家同场竞技，
+并存在吃、碰、杠等副露操作和最低 8 番的胡牌门槛。
+与完全信息博弈（如围棋）不同，麻将属于部分可观测马尔可夫决策过程（POMDP），
+传统搜索方法难以直接应用~\cite{silver2016mastering}。
+
+近年来强化学习（RL）和监督学习（SL）在麻将 AI 领域取得显著进展。
+Suphx~\cite{li2020suphx} 在日本麻将上超越人类专业选手；
+IJCAI 2020 竞赛~\cite{ijcai2020} 为国标麻将提供了标准数据集与评测环境。
+本工作基于 IJCAI 2020 数据集，聚焦于 SL Bot 的系统性优化。
+
+\paragraph{主要贡献}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt,parsep=0pt]
+  \item 将观测通道数从 6 扩展至 66，涵盖完整可见信息；
+  \item 设计基于 ResNet 的分头模型，引入动作类型辅助预测头；
+  \item 提出向听数感知的危险度惩罚与现物奖励后处理框架；
+  \item 引入七对/清一色专用特征通道与番数加权训练；
+  \item 系统分析多个行为异常现象的根因，具有较强的工程参考价值。
+\end{enumerate}
+
+% ============================================================
+\section{背景与数据集}
+\label{sec:background}
+% ============================================================
+
+\subsection{国标麻将规则摘要}
+
+国标麻将使用 144 张牌（万/条/筒各 1--9 各 4 张，外加字牌和花牌），
+4 名玩家轮流摸牌打牌。
+动作空间包括弃牌（34 种）、吃（63 种组合）、碰（34 种）、
+杠（明杠/暗杠/补杠各 34 种）、胡牌和过，共 \textbf{235} 个合法动作。
+胡牌需满足最低 8 番的门槛，鼓励玩家追求高番牌型。
+
+\subsection{数据集描述}
+
+训练数据来自 IJCAI 2020 冠军 Bot 的自对弈，共 \textbf{98,209} 局。
+参考实现为中科大团队（比赛第 4 名）的纯 SL 方案：
+状态空间 $4\times9\times145$ 通道，动作空间 235 维。
+
+% ============================================================
+\section{算法设计}
+\label{sec:method}
+% ============================================================
+
+\subsection{观测特征工程}
+
+\begin{table}[H]
+\centering
+\caption{66 通道特征表示（最终版本）}
+\label{tab:features}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{clr}
+\toprule
+通道区间 & 含义 & 数量 \\
+\midrule
+0       & 门风牌（one-hot 广播）     & 1  \\
+1       & 圈风牌（one-hot 广播）     & 1  \\
+2--5    & 手牌计数（第 $k$ 层代表 $\geq\!k\!+\!1$ 张）& 4  \\
+6--9    & 场上可见牌（弃牌+副露）    & 4  \\
+10--13  & 剩余牌数（归一化）         & 4  \\
+14      & 最近一张弃牌               & 1  \\
+15--18  & 各玩家牌墙剩余（归一化）   & 4  \\
+19--34  & 各玩家弃牌历史（$4\times4$）& 16 \\
+35--50  & 各玩家副露牌（$4\times4$） & 16 \\
+51      & 杠后摸牌标志               & 1  \\
+52      & 最后一张牌标志             & 1  \\
+53--55  & 对手危险度（3 位对手）     & 3  \\
+56--59  & 弃牌位置编码（归一化序号） & 4  \\
+60      & 向听数（归一化，$0\!=\!$听牌）& 1  \\
+61      & 有效进张牌（归一化剩余数） & 1  \\
+62      & 七对向听数（归一化）       & 1  \\
+63--65  & 万/条/筒清一色向听数       & 3  \\
+\midrule
+        & \textbf{合计}              & \textbf{66} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+特征矩阵维度为 $C \times 4 \times 9$（$C=66$），
+$4\times9$ 对应麻将牌的自然二维网格（4 种花色，每色 9 张）。
+
+\paragraph{危险度估计（通道 53--55）}
+对每位对手 $p$ 及候选弃牌 $t$，采用启发式评分：
+\begin{equation}
+d(p,t) = \alpha_0 \mathbb{1}[\text{非现物}]
+        + \alpha_1 \mathbb{1}[\text{筋牌}]
+        + \alpha_2 \cdot \text{suit\_pressure}(p)
+\label{eq:danger}
+\end{equation}
+其中现物（已被对手打出的牌）风险为 0，
+副露牌花色附近的牌风险更高（$\alpha_2$ 随副露数线性增加）。
+
+\paragraph{有效进张（通道 61）}
+穷举 34 种牌类测试向听数变化：
+若摸入牌 $t$ 后向听数下降，则该格填入剩余张数 $\text{remaining}(t)/4$；
+否则为 0。最多调用 34 次 \texttt{MahjongShanten}，
+在预处理阶段性能可接受。
+
+\paragraph{特殊番型向听（通道 62--65）}
+七对向听 $= 6 - |\text{对子数}|$；
+清一色向听粗估为 $13 - |\text{同花色手牌数}|$，
+归一化后分别写入对应通道。
+
+\subsection{神经网络结构}
+
+网络采用 ResNet 风格的分头架构，如图~\ref{fig:model} 所示。
+
+\paragraph{主干（Trunk）}
+两层卷积提取局面特征：
+$\text{Conv}_{3\times3}^{128} \to \text{BN} \to \text{ReLU}
+ \to \text{Conv}_{3\times3}^{64} \to \text{BN} \to \text{ReLU}$。
+
+\paragraph{残差块（ResBlock $\times$ 6）}
+每块结构为：
+$\text{Conv}_{3\times3}^{64} \to \text{BN} \to \text{ReLU}
+ \to \text{Conv}_{3\times3}^{64} \to \text{BN} \to \oplus \to \text{ReLU}$，
+其中 $\oplus$ 为残差加和，带 $1\times1$ 跳接投影层~\cite{he2016deep}。
+
+\paragraph{分头（Multi-Head）}
+Flatten $\to$ FC512 $\to$ ReLU $\to$ FC256 $\to$ ReLU 之后分叉：
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt,parsep=0pt]
+  \item \textbf{动作类型头}（type\_head）：FC8，预测 8 类动作类型
+    （Pass/Hu/Play/Chi/Peng/Gang/AnGang/BuGang）；
+  \item \textbf{动作子头}（6 个 tile\_head）：每类动作各一个 FC，
+    输出具体牌位 logit。
+\end{itemize}
+
+\paragraph{Logit 合成}
+\begin{equation}
+\text{logit}(a) = \text{typeLogit}[\text{class}(a)] + \text{tileLogit}(a)
+\end{equation}
+非法动作位填 $-100.0$ 后做 softmax。选择 $-100$ 而非 $-\infty$ 是为了
+避免与 label smoothing 交互时 $\log\text{softmax}(-\infty)$ 溢出。
+
+\paragraph{训练目标}
+\begin{equation}
+\calL = \calL_{\text{policy}} + 0.2\,\calL_{\text{type}}
+\end{equation}
+$\calL_{\text{policy}}$ 为番数加权交叉熵（见第~\ref{sec:training} 节），
+$\calL_{\text{type}}$ 为动作类型的交叉熵辅助损失。
+
+\subsection{推理后处理框架}
+
+推理时对模型原始 logit 依次施加以下调整（图~\ref{fig:postprocess}）：
+
+\paragraph{① 向听数感知危险惩罚}
+\begin{equation}
+a_{\text{play}} \mathrel{-}= 2.0 \cdot d(t) \cdot
+\min\!\left(1,\; \frac{\text{shanten}}{3}\right)
+\label{eq:danger_pen}
+\end{equation}
+向听数 $\geq 3$ 时全力防守，向听数 $=0$（听牌）时不惩罚，
+允许进攻摸胡。
+
+\paragraph{② 现物（Genbutsu）奖励}
+\begin{equation}
+a_{\text{play}} \mathrel{+}= 0.3
+\quad \text{若 } t \in \bigcup_{p=1}^{3}\text{discards}(p)
+\label{eq:genbutsu}
+\end{equation}
+弱奖励（$+0.3$）确保模型有明显偏好时仍能覆盖规则建议，
+避免完全服从现物而放弃牌效。
+
+\paragraph{③ 听牌进攻}
+若 $\text{shanten}=0$，则 $\text{Pass} \mathrel{-}= 1.0$，
+抑制消极等待行为。
+
+\paragraph{④ 七对子保护}
+若七对向听 $\leq$ 普通向听且 $\leq 2$，
+对子牌打出得 $-0.5$ 惩罚，引导 Bot 保留对子追七对。
+
+\paragraph{⑤ 轻碰/杠惩罚}
+吃 $-0.45$，碰 $-0.35$，杠 $-0.30$，补杠 $-0.25$，
+平衡副露积极性（过强惩罚会导致碰/杠行为消失，见第~\ref{sec:phenomenon} 节）。
+
+% ============================================================
+\section{训练流程优化}
+\label{sec:training}
+% ============================================================
+
+\subsection{赢家数据过滤}
+
+解析每局 \texttt{Score} 行，仅保留得分最高玩家的状态-动作对。
+直觉上胡牌玩家的决策更具参考价值；
+但完全过滤可能导致防守样本稀缺，是值得深入研究的权衡点。
+
+\subsection{番数加权采样}
+
+用赢家得分代理番数，计算样本权重：
+\begin{equation}
+w_i = \log_2\!\left(\frac{\max(\text{score}_i,\,8)}{8}\right) + 1
+\end{equation}
+8 分对应权重 1.0，128 分对应权重 4.0。加权策略损失为：
+\begin{equation}
+\calL_{\text{policy}}
+= \frac{1}{|\calB|}\sum_{i\in\calB} \bar{w}_i \cdot \text{CE}(f(s_i),a_i)
+\label{eq:weighted_loss}
+\end{equation}
+其中 $\bar{w}_i = w_i / \bar{w}$ 为 batch 内归一化权重。
+
+\subsection{延迟 LRU 加载}
+
+特征扩展后（6$\to$66 通道），全量加载约需 30 GB 内存。
+改用 \texttt{OrderedDict} 实现 LRU 缓存（默认 256 个 \texttt{.npz} 文件），
+内存峰值降至 $\sim$4 GB。
+
+\subsection{多进程预处理}
+
+使用 \texttt{multiprocessing.Pool.imap()} 并行处理，
+实测加速比约 $N_{\text{core}}-1$ 倍。
+工程注意事项：连续特征须以 float16 保存（int8 会将 $[0,1]$ 截断为 0）。
+
+\subsection{断点续训}
+
+保存完整训练状态（model / optimizer / scheduler / epoch），
+支持 \texttt{--resume} 从任意 checkpoint 继续，
+在云端 NPU 环境（任务超时频繁中断）中尤为重要。
+
+% ============================================================
+\section{有趣的现象与启发}
+\label{sec:phenomenon}
+% ============================================================
+
+\subsection{碰/杠行为消失}
+
+\textbf{现象：}早期版本 Bot 完全不碰牌、不杠牌。
+
+\textbf{根因分析：}两个耦合因素：
+① 赢家数据偏门清（清一色等番型往往门清不副露），
+   导致训练集碰/杠样本极少；
+② 后处理惩罚过重（原始碰 $-0.80$，杠 $-0.80$），
+   彻底掩盖模型的原始碰牌偏好。
+
+\textbf{解法：}将惩罚降至碰 $-0.35$、杠 $-0.30$，
+并对持有 3 张以上时额外回调奖励，恢复正常副露行为。
+
+\textbf{启发：}\textit{后处理强规则与模型分布之间的耦合效应非常显著}——
+过强的规则惩罚可能完全覆盖模型学到的有效策略，
+需在每次调参后进行行为层面的验证，而不仅仅是看 loss 或准确率。
+
+\subsection{频繁点炮问题}
+
+\textbf{现象：}Bot 以较高频率打出对手需要的胡牌牌（点炮）。
+
+\textbf{根因分析：}纯 SL 模型从胡牌玩家视角学习，
+缺乏"哪张牌对对手危险"的显式感知；
+PACK 通道虽已编码对手副露，但模型尚未建立可靠的危险度因果关联。
+
+\textbf{解法：}
+引入危险度特征通道（通道 53--55）并结合式~(\ref{eq:danger_pen}) 的向听感知衰减——
+越接近听牌越少防守，实现进攻与防守的动态平衡。
+弱奖励安全牌（式~\ref{eq:genbutsu}，$+0.3$）比强惩罚危险牌更稳健，
+因为前者不会覆盖模型在牌效上的合理判断。
+
+\subsection{平均番数偏低}
+
+\textbf{现象：}Bot 胡牌平均番数较低，七对、清一色等高番牌型极少出现。
+
+\textbf{根因分析：}
+① 高番局在训练数据中占比小（$<5\%$）；
+② 模型缺乏对七对、清一色等特殊番型向听进度的感知；
+③ 未加权的交叉熵损失对低番高频样本过度拟合。
+
+\textbf{解法（已实现，重训后生效）：}
+七对/清一色向听数特征通道（通道 62--65）+
+番数加权损失（式~\ref{eq:weighted_loss}）+
+七对子后处理保护（$-0.5$ 惩罚打对子）。
+
+\subsection{NPU 平台数值稳定性问题}
+
+在华为 Ascend NPU 上训练时发现若干平台特有问题，
+对跨平台部署具有较强参考价值（表~\ref{tab:npu}）。
+
+\begin{table}[H]
+\centering
+\caption{NPU 平台典型问题与解法}
+\label{tab:npu}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{2.2cm}p{2.0cm}p{2.2cm}}
+\toprule
+问题 & 现象 & 解法 \\
+\midrule
+\texttt{non\_blocking=True} &
+  error 507001 Segfault &
+  NPU 强制关闭 \\
+masked\_fill 用 finfo.min &
+  loss 爆炸至 $10^7$ &
+  改用 $-100.0$ \\
+int8 保存连续特征 &
+  归一化值截断为 0 &
+  改用 float16 \\
+label\_smooth $\times$ 大负 mask &
+  log-softmax($-\infty$)溢出 &
+  mask 值 $\geq -100$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{启发：}跨硬件平台迁移时，数值稳定性问题往往比 API 兼容性更难调试；
+建议对关键张量的统计量（min/max/NaN 比例）进行实时监控。
+
+% ============================================================
+\section{开放式问题与研究方向}
+\label{sec:open}
+% ============================================================
+
+\subsection{SL 上限与数据多样性}
+
+纯 SL 方法的上限受制于训练数据的策略分布。
+冠军 Bot 存在风格偏差（偏门清），使赢家过滤后副露样本稀缺。
+\textbf{研究方向：}多样化数据源混合（不同风格 Bot 的对局），
+或设计基于结果的重采样策略——在保留高质量赢家样本的同时，
+补充足够的防守样本以平衡策略分布。
+
+\subsection{从 SL 到 RL 的迁移}
+
+SL 模型是 RL 的良好初始化策略。
+参考 AlphaGo~\cite{silver2016mastering} 的经验，
+SL 策略网络 $\to$ RL 自博弈可进一步提升。
+\textbf{挑战：}CSM 的稀疏奖励（仅局末才知道得分）$+$ 4 人博弈的信用分配
+$+$ 番数计算的规则复杂性，使奖励函数设计本身就是核心研究课题。
+
+一个有趣的研究问题：如何设计稠密中间奖励？
+候选方案：向听数变化奖励、危险度降低奖励、胡牌番数奖励。
+这些中间奖励是否会产生"奖励黑客"行为（例如学会无限循环保持听牌状态）？
+
+\subsection{隐藏信息的贝叶斯推断}
+
+当前特征仅使用可见信息。对手手牌的贝叶斯推断是提升防守能力的重要方向：
+\begin{equation}
+P(\text{hand}_j \mid \text{obs}_{1:t})
+\propto P(\text{obs}_{1:t} \mid \text{hand}_j)\, P(\text{hand}_j)
+\end{equation}
+这本质上是基于不完整观测的手牌推断问题，
+可用变分推断或粒子滤波建模，是麻将 AI 区别于完全信息博弈的核心挑战。
+
+\subsection{后处理的参数化与可学习化}
+
+当前后处理系统包含约 10 个人工调参的超参数，
+存在过拟合当前模型偏差的风险。
+\textbf{研究方向：}
+用轻量残差网络替代规则后处理（"可微规则"），
+或通过少量对弈数据学习后处理层参数，实现端到端优化。
+
+\subsection{番数预测辅助任务}
+
+可进一步引入\textbf{番数预测头}（预测最终胡牌番数期望），
+作为价值估计辅助信号，为危险惩罚的衰减系数提供数据驱动的依据，
+替代当前式~(\ref{eq:danger_pen}) 中的硬编码阈值 3。
+
+% ============================================================
+\section{结论}
+\label{sec:conclusion}
+% ============================================================
+
+本文系统总结了国标麻将 SL Bot 从基础实现到工程化优化的完整过程，
+主要贡献包括：66 通道精细特征工程、ResNet 分头模型、
+向听数感知的推理后处理框架、赢家过滤与番数加权训练，
+以及多项 Ascend NPU 工程适配。
+
+实践表明，\textbf{特征工程与后处理规则对 SL Bot 行为的影响十分显著，
+有时甚至超过模型容量本身}。
+多个有趣的行为异常（碰牌消失、频繁点炮、高番稀少）
+都能追溯到数据分布偏差或后处理参数不当，
+提示在 AI 棋牌游戏研究中需对数据质量和推理部署给予同等重视。
+
+未来工作的主要方向是从 SL 过渡到 RL 自博弈，
+引入隐藏信息推断模块，以及将规则后处理参数化为可学习组件。
+
+\end{multicols}
+
+% ============================================================
+% Figures (full-width, placed after two-column body)
+% ============================================================
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  box/.style={
+    rectangle, draw=black!70, rounded corners=3pt,
+    minimum width=3.2cm, minimum height=0.65cm,
+    text centered, font=\small
+  },
+  sbox/.style={box, minimum width=2.4cm, fill=red!10},
+  node distance=0.45cm and 0.5cm
+]
+% Main trunk
+\node[box, fill=blue!12] (inp) {输入 $66\times4\times9$};
+\node[box, fill=blue!12, right=of inp] (c1)  {Conv$_{3\times3}^{128}$ + BN + ReLU};
+\node[box, fill=blue!12, right=of c1]  (c2)  {Conv$_{3\times3}^{64}$ + BN + ReLU};
+\node[box, fill=green!15, right=of c2] (res) {ResBlock $\times$ 6};
+\node[box, fill=orange!15, right=of res] (fc) {FC512 $\to$ FC256};
+
+% Heads
+\node[sbox, below left=0.8cm and 0.8cm of fc]  (th)  {type\_head (FC8)};
+\node[sbox, below right=0.8cm and 0.5cm of fc] (dh)  {6 tile sub-heads};
+\node[box, fill=gray!20, below=1.8cm of fc]     (out) {Merge + Mask $\to$ 235-dim logit};
+
+% Arrows
+\draw[->] (inp) -- (c1);
+\draw[->] (c1)  -- (c2);
+\draw[->] (c2)  -- (res);
+\draw[->] (res) -- (fc);
+\draw[->] (fc)  -- (th);
+\draw[->] (fc)  -- (dh);
+\draw[->] (th)  -- (out);
+\draw[->] (dh)  -- (out);
+\end{tikzpicture}
+\caption{分头 ResNet 模型结构。主干提取局面特征，
+type\_head 提供动作类型辅助监督，6 个 tile sub-head 预测具体动作 logit，
+最终合并后施加合法动作掩码输出 235 维策略向量。}
+\label{fig:model}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  >=Latex,
+  step/.style={rectangle, draw=black!70, rounded corners=3pt,
+    fill=yellow!10, minimum width=11cm, minimum height=0.65cm,
+    text centered, font=\small},
+  node distance=0.38cm
+]
+\node[step] (raw)  {原始模型 logit（235 维）};
+\node[step, below=of raw]  (s1) {① 向听感知危险惩罚（式~\ref{eq:danger_pen}）：$a_{\text{play}} \mathrel{-}= 2.0 \cdot d(t) \cdot \min(1, \text{shanten}/3)$};
+\node[step, below=of s1]   (s2) {② 现物奖励（式~\ref{eq:genbutsu}）：安全牌 $+0.3$};
+\node[step, below=of s2]   (s3) {③ 听牌进攻：$\text{shanten}=0$ 时 Pass $-1.0$};
+\node[step, below=of s3]   (s4) {④ 七对子保护：对子牌 $-0.5$（七对向听 $\leq 2$ 时）};
+\node[step, below=of s4]   (s5) {⑤ 轻碰/杠惩罚：吃$-0.45$，碰$-0.35$，杠$-0.30$，补杠$-0.25$};
+\node[step, below=of s5, fill=green!10]   (end) {非法动作填 $-100.0$，取 argmax 输出动作};
+
+\draw[->] (raw) -- (s1);
+\draw[->] (s1)  -- (s2);
+\draw[->] (s2)  -- (s3);
+\draw[->] (s3)  -- (s4);
+\draw[->] (s4)  -- (s5);
+\draw[->] (s5)  -- (end);
+\end{tikzpicture}
+\caption{推理后处理流水线。每步对 logit 向量进行原地调整，
+最终取 argmax 输出合法动作。各步调整量均经过人工验证，
+确保模型偏好强时规则调整不覆盖模型判断。}
+\label{fig:postprocess}
+\end{figure}
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{li2020suphx}
+Junjie Li, Shuai Ma, Malong Yang, Qiaoyuan Mo, Ning Ding, Qiang Yan, and Yuandong Tian.
+\newblock Suphx: Mastering mahjong with deep reinforcement learning.
+\newblock \textit{arXiv preprint arXiv:2003.13590}, 2020.
+
+\bibitem{silver2016mastering}
+David Silver, Aja Huang, Chris~J. Maddison, Arthur Guez, Laurent Sifre,
+  George van den Driessche, Julian Schrittwieser, Ioannis Antonoglou,
+  Veda Panneershelvam, Marc Lanctot, Sander Dieleman, Dominik Grewe,
+  John Nham, Nal Kalchbrenner, Ilya Sutskever, Timothy Lillicrap, Madeleine Leach,
+  Koray Kavukcuoglu, Thore Graepel, and Demis Hassabis.
+\newblock Mastering the game of go with deep neural networks and tree search.
+\newblock \textit{Nature}, 529(7587):484--489, 2016.
+
+\bibitem{silver2017mastering}
+David Silver, Julian Schrittwieser, Karen Simonyan, Ioannis Antonoglou,
+  Aja Huang, Arthur Guez, Thomas Hubert, Lucas Baker, Matthew Lai,
+  Adrian Bolton, Yutian Chen, Timothy Lillicrap, Fan Hui, Laurent Sifre,
+  George van den Driessche, Thore Graepel, and Demis Hassabis.
+\newblock Mastering the game of go without human knowledge.
+\newblock \textit{Nature}, 550(7676):354--359, 2017.
+
+\bibitem{he2016deep}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In \textit{Proceedings of the IEEE Conference on Computer Vision and
+  Pattern Recognition (CVPR)}, pages 770--778, 2016.
+
+\bibitem{moravvcik2017deepstack}
+Matej Mora{\v{c}}{\'\i}k, Martin Schmid, Neil Burch, Viliam Lis{\'y},
+  Dustin Morrill, Nolan Bard, Trevor Davis, Kevin Waugh, Marc Lanctot,
+  and Michael Bowling.
+\newblock Deepstack: Expert-level artificial intelligence in heads-up no-limit poker.
+\newblock \textit{Science}, 356(6337):508--513, 2017.
+
+\bibitem{ijcai2020}
+{IJCAI-2020 Mahjong AI Competition}.
+\newblock Botzone platform: Chinese standard mahjong.
+\newblock \url{http://www.botzone.org.cn/game/Chinese-Standard-Mahjong}, 2020.
+
+\bibitem{mnih2015human}
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei~A. Rusu, Joel Veness,
+  Marc~G. Bellemare, Alex Graves, Martin Riedmiller, Andreas~K. Fidjeland,
+  Georg Ostrovski, Stig Petersen, Charles Beattie, Amir Sadik, Ioannis Antonoglou,
+  Helen King, Dharshan Kumaran, Daan Wierstra, Shane Legg, and Demis Hassabis.
+\newblock Human-level control through deep reinforcement learning.
+\newblock \textit{Nature}, 518(7540):529--533, 2015.
+
+\bibitem{brown2019superhuman}
+Noam Brown and Tuomas Sandholm.
+\newblock Superhuman {AI} for multiplayer poker.
+\newblock \textit{Science}, 365(6456):885--890, 2019.
+
+\end{thebibliography}
+
+\end{document}

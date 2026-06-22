@@ -1,0 +1,14 @@
+# RL training dependencies
+# Install with: pip install -r requirement.txt
+#
+# PyMahjongGB must be installed from GitHub:
+#   pip install git+https://github.com/ailab-pku/PyMahjongGB.git
+# or use the pre-built wheel if available (PyMahjongGB==1.3.0).
+
+torch>=1.4.0
+numpy>=1.16.0
+PyMahjongGB>=1.3.0
+
+# Optional: TensorBoard for training visualisation
+# tensorboard>=2.0.0
+
